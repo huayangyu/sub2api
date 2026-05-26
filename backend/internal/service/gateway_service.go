@@ -4110,27 +4110,9 @@ func rewriteSystemForNonClaudeCode(body []byte, system any) []byte {
 		originalSystemText = strings.Join(parts, "\n\n")
 	}
 
-	// 2. 构造 system 数组，对齐真实 Claude Code CLI 的 2-block 形态：
-	//    [0] billing attribution block（cc_version={cliVer}.{fp}; cc_entrypoint=cli; cch=00000;）
-	//    [1] "You are Claude Code..." prompt block（带 cache_control 作为稳定缓存断点）
-	//
-	//    billing block 的 cch=00000 是占位符，会被 buildUpstreamRequest 里的
-	//    signBillingHeaderCCH 替换成 xxhash64 签名。缺失 billing block 的系统 payload
-	//    是 Anthropic 判定第三方的关键信号之一（真实 CLI 每个请求都带）。
-	billingBlock, billingErr := buildBillingAttributionBlockJSON(body, claude.CLICurrentVersion)
-	ccPromptBlock, ccErr := marshalAnthropicSystemTextBlock(claudeCodeSystemPromptExtended, true)
-	if billingErr != nil || ccErr != nil {
-		logger.LegacyPrintf("service.gateway", "Warning: failed to build system blocks (billing=%v, cc=%v)", billingErr, ccErr)
-		return body
-	}
-	out, ok := setJSONRawBytes(body, "system", buildJSONArrayRaw([][]byte{billingBlock, ccPromptBlock}))
-	if !ok {
-		logger.LegacyPrintf("service.gateway", "Warning: failed to set Claude Code system prompt")
-		return body
-	}
-
-	// 3. 将原始 system prompt 作为 user/assistant 消息对注入到 messages 开头
-	//    模型仍通过 messages 接收完整指令，保留客户端功能
+	// 2. 先将原始 system prompt 作为 user/assistant 消息对注入到 messages 开头
+	//    这必须在计算 billing fingerprint 之前完成，因为 fingerprint 取决于
+	//    最终的第一条 user message 内容（chars[4,7,20]）。
 	ccPromptTrimmed := strings.TrimSpace(claudeCodeSystemPrompt)
 	if originalSystemText != "" && originalSystemText != ccPromptTrimmed && !hasClaudeCodePrefix(originalSystemText) {
 		instrMsg, err1 := json.Marshal(map[string]any{
@@ -4147,12 +4129,12 @@ func rewriteSystemForNonClaudeCode(body []byte, system any) []byte {
 		})
 		if err1 != nil || err2 != nil {
 			logger.LegacyPrintf("service.gateway", "Warning: failed to marshal system-to-messages injection")
-			return out
+			return body
 		}
 
 		// 重建 messages 数组：[instruction, ack, ...originalMessages]
 		items := [][]byte{instrMsg, ackMsg}
-		messagesResult := gjson.GetBytes(out, "messages")
+		messagesResult := gjson.GetBytes(body, "messages")
 		if messagesResult.IsArray() {
 			messagesResult.ForEach(func(_, msg gjson.Result) bool {
 				items = append(items, []byte(msg.Raw))
@@ -4160,9 +4142,31 @@ func rewriteSystemForNonClaudeCode(body []byte, system any) []byte {
 			})
 		}
 
-		if next, setOk := setJSONRawBytes(out, "messages", buildJSONArrayRaw(items)); setOk {
-			out = next
+		if next, setOk := setJSONRawBytes(body, "messages", buildJSONArrayRaw(items)); setOk {
+			body = next
 		}
+	}
+
+	// 3. 构造 system 数组，对齐真实 Claude Code CLI 的 2-block 形态：
+	//    [0] billing attribution block（cc_version={cliVer}.{fp}; cc_entrypoint=cli; cch=00000;）
+	//    [1] "You are Claude Code..." prompt block（带 cache_control 作为稳定缓存断点）
+	//
+	//    billing block 的 cch=00000 是占位符，会被 buildUpstreamRequest 里的
+	//    signBillingHeaderCCH 替换成 xxhash64 签名。缺失 billing block 的系统 payload
+	//    是 Anthropic 判定第三方的关键信号之一（真实 CLI 每个请求都带）。
+	//
+	//    注意：fingerprint 基于 messages 中第一条 user 消息的 chars[4,7,20] 计算，
+	//    因此必须在消息注入完成后再调用 buildBillingAttributionBlockJSON。
+	billingBlock, billingErr := buildBillingAttributionBlockJSON(body, claude.CLICurrentVersion)
+	ccPromptBlock, ccErr := marshalAnthropicSystemTextBlock(claudeCodeSystemPromptExtended, true)
+	if billingErr != nil || ccErr != nil {
+		logger.LegacyPrintf("service.gateway", "Warning: failed to build system blocks (billing=%v, cc=%v)", billingErr, ccErr)
+		return body
+	}
+	out, ok := setJSONRawBytes(body, "system", buildJSONArrayRaw([][]byte{billingBlock, ccPromptBlock}))
+	if !ok {
+		logger.LegacyPrintf("service.gateway", "Warning: failed to set Claude Code system prompt")
+		return body
 	}
 
 	return out
@@ -6181,11 +6185,6 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 		}
 	}
 
-	// OAuth账号：应用缓存的指纹到请求头（覆盖白名单透传的头）
-	if fingerprint != nil {
-		s.identityService.ApplyFingerprint(req, fingerprint)
-	}
-
 	// 确保必要的headers存在（保持原始大小写）
 	if getHeaderRaw(req.Header, "content-type") == "" {
 		setHeaderRaw(req.Header, "content-type", "application/json")
@@ -6209,6 +6208,12 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 			// - 保留 incoming beta 的同时，确保 OAuth 所需 beta 存在
 			applyClaudeCodeMimicHeaders(req, reqStream)
 
+			// 指纹覆盖：per-account 的 X-Stainless-* / User-Agent 覆盖全局默认值，
+			// 确保不同账号呈现不同的 OS/Arch/Runtime/Version 组合
+			if fingerprint != nil {
+				s.identityService.ApplyFingerprint(req, fingerprint)
+			}
+
 			incomingBeta := getHeaderRaw(req.Header, "anthropic-beta")
 			// Claude Code OAuth credentials are scoped to Claude Code.
 			// Non-haiku models MUST include claude-code beta for Anthropic to recognize
@@ -6222,6 +6227,9 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 			setHeaderRaw(req.Header, "anthropic-beta", mergeAnthropicBetaDropping(requiredBetas, incomingBeta, effectiveDropSet))
 		} else {
 			// Claude Code 客户端：尽量透传原始 header，仅补齐 oauth beta
+			if fingerprint != nil {
+				s.identityService.ApplyFingerprint(req, fingerprint)
+			}
 			clientBetaHeader := getHeaderRaw(req.Header, "anthropic-beta")
 			setHeaderRaw(req.Header, "anthropic-beta", stripBetaTokensWithSet(s.getBetaHeader(modelID, clientBetaHeader), effectiveDropSet))
 		}
@@ -9462,11 +9470,6 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		}
 	}
 
-	// OAuth 账号：应用指纹到请求头（受设置开关控制）
-	if ctEnableFP && ctFingerprint != nil {
-		s.identityService.ApplyFingerprint(req, ctFingerprint)
-	}
-
 	// 确保必要的 headers 存在（保持原始大小写）
 	if getHeaderRaw(req.Header, "content-type") == "" {
 		setHeaderRaw(req.Header, "content-type", "application/json")
@@ -9486,10 +9489,19 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		if mimicClaudeCode {
 			applyClaudeCodeMimicHeaders(req, false)
 
+			// 指纹覆盖：per-account 值覆盖全局默认
+			if ctEnableFP && ctFingerprint != nil {
+				s.identityService.ApplyFingerprint(req, ctFingerprint)
+			}
+
 			incomingBeta := getHeaderRaw(req.Header, "anthropic-beta")
 			requiredBetas := append(claude.FullClaudeCodeMimicryBetas(), claude.BetaTokenCounting)
 			setHeaderRaw(req.Header, "anthropic-beta", mergeAnthropicBetaDropping(requiredBetas, incomingBeta, ctEffectiveDropSet))
 		} else {
+			// Claude Code 客户端：应用指纹
+			if ctEnableFP && ctFingerprint != nil {
+				s.identityService.ApplyFingerprint(req, ctFingerprint)
+			}
 			clientBetaHeader := getHeaderRaw(req.Header, "anthropic-beta")
 			if clientBetaHeader == "" {
 				setHeaderRaw(req.Header, "anthropic-beta", claude.CountTokensBetaHeader)

@@ -10,9 +10,9 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// ccVersionInBillingRe matches the semver part of cc_version (X.Y.Z), preserving
-// the trailing message-derived suffix (e.g. ".c02") if present.
-var ccVersionInBillingRe = regexp.MustCompile(`cc_version=\d+\.\d+\.\d+`)
+// ccVersionInBillingRe matches the full cc_version field including the fingerprint suffix.
+// Format: cc_version=X.Y.Z.{3-char-hex-fp}
+var ccVersionInBillingRe = regexp.MustCompile(`cc_version=\d+\.\d+\.\d+\.[a-f0-9]{3}`)
 
 // cchPlaceholderRe matches the cch=00000 placeholder in billing header text,
 // scoped to x-anthropic-billing-header to avoid touching user content.
@@ -20,9 +20,9 @@ var cchPlaceholderRe = regexp.MustCompile(`(x-anthropic-billing-header:[^"]*?\bc
 
 const cchSeed uint64 = 0x6E52736AC806831E
 
-// syncBillingHeaderVersion rewrites cc_version in x-anthropic-billing-header
-// system text blocks to match the version extracted from userAgent.
-// Only touches system array blocks whose text starts with "x-anthropic-billing-header".
+// syncBillingHeaderVersion rewrites cc_version (including fingerprint suffix) in
+// x-anthropic-billing-header system text blocks to match the version extracted from userAgent.
+// The fingerprint suffix depends on the version, so both must be recomputed together.
 func syncBillingHeaderVersion(body []byte, userAgent string) []byte {
 	version := ExtractCLIVersion(userAgent)
 	if version == "" {
@@ -34,7 +34,8 @@ func syncBillingHeaderVersion(body []byte, userAgent string) []byte {
 		return body
 	}
 
-	replacement := "cc_version=" + version
+	fp := computeClaudeCodeFingerprint(body, version)
+	replacement := "cc_version=" + version + "." + fp
 	idx := 0
 	systemResult.ForEach(func(_, item gjson.Result) bool {
 		text := item.Get("text")
