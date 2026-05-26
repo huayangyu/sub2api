@@ -67,6 +67,36 @@ const DefaultCacheControlTTL = "5m"
 // 必须与 DefaultHeaders["User-Agent"] 中的版本号严格一致；不一致会被 Anthropic 判第三方。
 const CLICurrentVersion = "2.1.92"
 
+// CLIVersionPool 是可用的 CLI 版本池，按 accountID 确定性选择。
+// 多版本分散降低所有请求集中在单一版本号的风险。
+// 每个版本对应一个 SDK package version，保持一致性。
+var CLIVersionPool = []VersionProfile{
+	{CLIVersion: "2.1.92", PackageVersion: "0.70.0", RuntimeVersion: "v24.13.0"},
+	{CLIVersion: "2.1.91", PackageVersion: "0.69.1", RuntimeVersion: "v22.14.0"},
+	{CLIVersion: "2.1.90", PackageVersion: "0.69.0", RuntimeVersion: "v22.12.0"},
+	{CLIVersion: "2.1.89", PackageVersion: "0.68.2", RuntimeVersion: "v22.11.0"},
+	{CLIVersion: "2.1.88", PackageVersion: "0.68.0", RuntimeVersion: "v24.13.0"},
+}
+
+// VersionProfile 将 CLI 版本与对应的 SDK / runtime 版本绑定，确保三者一致。
+type VersionProfile struct {
+	CLIVersion     string
+	PackageVersion string
+	RuntimeVersion string
+}
+
+// SelectVersionProfile 根据 accountID 确定性选择版本 profile。
+func SelectVersionProfile(accountID int64) VersionProfile {
+	if len(CLIVersionPool) == 0 {
+		return VersionProfile{CLIVersion: CLICurrentVersion, PackageVersion: "0.70.0", RuntimeVersion: "v24.13.0"}
+	}
+	idx := int(accountID) % len(CLIVersionPool)
+	if idx < 0 {
+		idx = -idx
+	}
+	return CLIVersionPool[idx]
+}
+
 // FullClaudeCodeMimicryBetas 返回最"像"真实 Claude Code CLI 的完整 beta 列表，
 // 用于 OAuth 账号伪装成 Claude Code 时使用。
 // 顺序与真实 CLI 抓包一致。
@@ -76,15 +106,20 @@ const CLICurrentVersion = "2.1.92"
 //   - OAuth 账号 + haiku：Anthropic 对 haiku 不做 third-party 判定，使用 HaikuBetaHeader 即可。
 //   - API-key 账号：不要使用本函数，参见 APIKeyBetaHeader。
 //   - 不默认加入 redact-thinking，避免上游抹除 thinking 内容；客户端显式传入时由合并逻辑保留。
+//
+// 2026-05 更新：补齐 fine-grained-tool-streaming 和 token-counting，
+// 真实 CLI 2.1.88+ 的 /v1/messages 请求均携带这两个 beta。
 func FullClaudeCodeMimicryBetas() []string {
 	return []string{
 		BetaClaudeCode,
 		BetaOAuth,
 		BetaInterleavedThinking,
+		BetaFineGrainedToolStreaming,
 		BetaPromptCachingScope,
 		BetaEffort,
 		BetaContextManagement,
 		BetaExtendedCacheTTL,
+		BetaTokenCounting,
 	}
 }
 
@@ -104,6 +139,61 @@ var DefaultHeaders = map[string]string{
 	"X-Stainless-Timeout":                       "600",
 	"X-App":                                     "cli",
 	"Anthropic-Dangerous-Direct-Browser-Access": "true",
+}
+
+// FingerprintProfile 定义一组完整的客户端环境指纹。
+// 每个 profile 模拟一个真实的 Claude Code 用户环境。
+type FingerprintProfile struct {
+	OS             string // macOS, Linux, Windows
+	Arch           string // arm64, x64
+	Runtime        string // node
+	RuntimeVersion string // v22.x, v24.x
+}
+
+// FingerprintProfilePool 是可用的环境指纹池。
+// 真实用户群体中 macOS/Linux/Windows 和 arm64/x64 都有分布。
+var FingerprintProfilePool = []FingerprintProfile{
+	{OS: "macOS", Arch: "arm64", Runtime: "node", RuntimeVersion: "v24.13.0"},
+	{OS: "Linux", Arch: "x64", Runtime: "node", RuntimeVersion: "v22.14.0"},
+	{OS: "macOS", Arch: "arm64", Runtime: "node", RuntimeVersion: "v22.12.0"},
+	{OS: "Linux", Arch: "arm64", Runtime: "node", RuntimeVersion: "v24.13.0"},
+	{OS: "Windows_NT", Arch: "x64", Runtime: "node", RuntimeVersion: "v22.14.0"},
+	{OS: "macOS", Arch: "x64", Runtime: "node", RuntimeVersion: "v24.13.0"},
+	{OS: "Linux", Arch: "x64", Runtime: "node", RuntimeVersion: "v24.13.0"},
+	{OS: "Windows_NT", Arch: "arm64", Runtime: "node", RuntimeVersion: "v22.12.0"},
+}
+
+// SelectFingerprintProfile 根据 accountID 确定性选择环境指纹 profile。
+func SelectFingerprintProfile(accountID int64) FingerprintProfile {
+	if len(FingerprintProfilePool) == 0 {
+		return FingerprintProfile{OS: "Linux", Arch: "arm64", Runtime: "node", RuntimeVersion: "v24.13.0"}
+	}
+	idx := int(accountID) % len(FingerprintProfilePool)
+	if idx < 0 {
+		idx = -idx
+	}
+	return FingerprintProfilePool[idx]
+}
+
+// BuildDefaultHeadersForAccount 根据 accountID 生成该账号专属的默认请求头。
+// 版本和环境指纹均从 pool 中确定性选择，确保同一账号始终使用相同的指纹。
+// TODO: 待后续 PR 接入到 gateway 转发逻辑中，替换全局 DefaultHeaders
+func BuildDefaultHeadersForAccount(accountID int64) map[string]string {
+	vp := SelectVersionProfile(accountID)
+	fp := SelectFingerprintProfile(accountID)
+	return map[string]string{
+		"User-Agent":                                "claude-cli/" + vp.CLIVersion + " (external, cli)",
+		"X-Stainless-Lang":                          "js",
+		"X-Stainless-Package-Version":               vp.PackageVersion,
+		"X-Stainless-OS":                            fp.OS,
+		"X-Stainless-Arch":                          fp.Arch,
+		"X-Stainless-Runtime":                       fp.Runtime,
+		"X-Stainless-Runtime-Version":               fp.RuntimeVersion,
+		"X-Stainless-Retry-Count":                   "0",
+		"X-Stainless-Timeout":                       "600",
+		"X-App":                                     "cli",
+		"Anthropic-Dangerous-Direct-Browser-Access": "true",
+	}
 }
 
 // Model 表示一个 Claude 模型

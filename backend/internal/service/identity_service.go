@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -24,15 +25,20 @@ var (
 	userAgentVersionRegex = regexp.MustCompile(`/(\d+)\.(\d+)\.(\d+)`)
 )
 
-// 默认指纹值（当客户端未提供时使用）
-var defaultFingerprint = Fingerprint{
-	UserAgent:               "claude-cli/2.1.92 (external, cli)",
-	StainlessLang:           "js",
-	StainlessPackageVersion: "0.70.0",
-	StainlessOS:             "Linux",
-	StainlessArch:           "arm64",
-	StainlessRuntime:        "node",
-	StainlessRuntimeVersion: "v24.13.0",
+// defaultFingerprintForAccount 根据 accountID 从 profile 池中确定性选择默认指纹。
+// 不同账号使用不同的 OS/Arch/Runtime/Version 组合，模拟真实用户群体的多样性。
+func defaultFingerprintForAccount(accountID int64) Fingerprint {
+	vp := claude.SelectVersionProfile(accountID)
+	fp := claude.SelectFingerprintProfile(accountID)
+	return Fingerprint{
+		UserAgent:               "claude-cli/" + vp.CLIVersion + " (external, cli)",
+		StainlessLang:           "js",
+		StainlessPackageVersion: vp.PackageVersion,
+		StainlessOS:             fp.OS,
+		StainlessArch:           fp.Arch,
+		StainlessRuntime:        fp.Runtime,
+		StainlessRuntimeVersion: fp.RuntimeVersion,
+	}
 }
 
 // Fingerprint represents account fingerprint data
@@ -103,7 +109,7 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 	}
 
 	// 缓存不存在或解析失败，创建新指纹
-	fp := s.createFingerprintFromHeaders(headers)
+	fp := s.createFingerprintFromHeadersWithAccountID(headers, accountID)
 
 	// 生成随机ClientID
 	fp.ClientID = generateClientID()
@@ -120,22 +126,26 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 
 // createFingerprintFromHeaders 从请求头创建指纹
 func (s *IdentityService) createFingerprintFromHeaders(headers http.Header) *Fingerprint {
-	fp := &Fingerprint{}
+	return s.createFingerprintFromHeadersWithAccountID(headers, 0)
+}
 
-	// 获取User-Agent
+// createFingerprintFromHeadersWithAccountID 从请求头创建指纹，使用 accountID 选择默认 profile
+func (s *IdentityService) createFingerprintFromHeadersWithAccountID(headers http.Header, accountID int64) *Fingerprint {
+	fp := &Fingerprint{}
+	dfp := defaultFingerprintForAccount(accountID)
+
 	if ua := headers.Get("User-Agent"); ua != "" {
 		fp.UserAgent = ua
 	} else {
-		fp.UserAgent = defaultFingerprint.UserAgent
+		fp.UserAgent = dfp.UserAgent
 	}
 
-	// 获取x-stainless-*头，如果没有则使用默认值
-	fp.StainlessLang = getHeaderOrDefault(headers, "X-Stainless-Lang", defaultFingerprint.StainlessLang)
-	fp.StainlessPackageVersion = getHeaderOrDefault(headers, "X-Stainless-Package-Version", defaultFingerprint.StainlessPackageVersion)
-	fp.StainlessOS = getHeaderOrDefault(headers, "X-Stainless-OS", defaultFingerprint.StainlessOS)
-	fp.StainlessArch = getHeaderOrDefault(headers, "X-Stainless-Arch", defaultFingerprint.StainlessArch)
-	fp.StainlessRuntime = getHeaderOrDefault(headers, "X-Stainless-Runtime", defaultFingerprint.StainlessRuntime)
-	fp.StainlessRuntimeVersion = getHeaderOrDefault(headers, "X-Stainless-Runtime-Version", defaultFingerprint.StainlessRuntimeVersion)
+	fp.StainlessLang = getHeaderOrDefault(headers, "X-Stainless-Lang", dfp.StainlessLang)
+	fp.StainlessPackageVersion = getHeaderOrDefault(headers, "X-Stainless-Package-Version", dfp.StainlessPackageVersion)
+	fp.StainlessOS = getHeaderOrDefault(headers, "X-Stainless-OS", dfp.StainlessOS)
+	fp.StainlessArch = getHeaderOrDefault(headers, "X-Stainless-Arch", dfp.StainlessArch)
+	fp.StainlessRuntime = getHeaderOrDefault(headers, "X-Stainless-Runtime", dfp.StainlessRuntime)
+	fp.StainlessRuntimeVersion = getHeaderOrDefault(headers, "X-Stainless-Runtime-Version", dfp.StainlessRuntimeVersion)
 
 	return fp
 }
