@@ -70,6 +70,10 @@ const CLICurrentVersion = "2.1.92"
 // CLIVersionPool 是可用的 CLI 版本池，按 accountID 确定性选择。
 // 多版本分散降低所有请求集中在单一版本号的风险。
 // 每个版本对应一个 SDK package version，保持一致性。
+//
+// ⚠️ 运维提醒：定期更新此池以匹配真实用户的版本分布。
+// 如果池中版本过旧（如真实用户已普遍升级到 2.2.x 但池中仍是 2.1.x），
+// Anthropic 可通过版本分布统计识别异常流量。建议每月检查 Claude Code 发布日志。
 var CLIVersionPool = []VersionProfile{
 	{CLIVersion: "2.1.92", PackageVersion: "0.70.0", RuntimeVersion: "v24.13.0"},
 	{CLIVersion: "2.1.91", PackageVersion: "0.69.1", RuntimeVersion: "v22.14.0"},

@@ -50,47 +50,6 @@ const (
 	// to match real Claude CLI traffic as closely as possible. When we need a visual
 	// separator between system blocks, we add "\n\n" at concatenation time.
 	claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
-	// claudeCodeSystemPromptExtended 是用于 mimicry 注入的扩展版 system prompt。
-	// 长度超过 1024 token（约 4000 字符），确保触发 Anthropic 的 prompt caching。
-	// 内容模拟真实 Claude Code CLI 的 system prompt 结构。
-	claudeCodeSystemPromptExtended = `You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
-
-IMPORTANT: You should be thorough and complete in your responses. Do not cut corners or skip steps.
-
-# Memory
-If the current working directory contains a file called CLAUDE.md, it will be automatically loaded into your context. This file serves as your persistent memory across conversations. Use it to store important project context, decisions, and patterns.
-
-# Tone and style
-- Be concise and direct in your responses
-- Avoid unnecessary preamble or filler
-- Use technical language appropriate for the context
-- When explaining code, focus on the "why" not just the "what"
-
-# Proactivity
-You are allowed to be proactive, but only when the user's intent is clear. For ambiguous requests, ask for clarification rather than guessing.
-
-# Following conventions
-When making changes to code, first understand the existing patterns and conventions in the codebase. Match the style, naming conventions, and architecture patterns already in use.
-
-# Code style
-- Follow the existing code style in the project
-- Use consistent naming conventions
-- Keep functions focused and small
-- Write self-documenting code where possible
-
-# Doing tasks
-- Read relevant code before making changes
-- Consider edge cases and error handling
-- Test your changes when possible
-- Verify that your changes don't break existing functionality
-
-# Tool usage
-- Use the most appropriate tool for each task
-- Prefer dedicated tools over shell commands when available
-- Make independent tool calls in parallel when possible
-
-# Environment
-You have access to the user's local development environment. You can read and write files, run commands, and interact with version control systems.`
 	maxCacheControlBlocks  = 4 // Anthropic API 允许的最大 cache_control 块数量
 
 	defaultUserGroupRateCacheTTL = 30 * time.Second
@@ -4110,46 +4069,14 @@ func rewriteSystemForNonClaudeCode(body []byte, system any) []byte {
 		originalSystemText = strings.Join(parts, "\n\n")
 	}
 
-	// 2. 先将原始 system prompt 作为 user/assistant 消息对注入到 messages 开头
-	//    这必须在计算 billing fingerprint 之前完成，因为 fingerprint 取决于
-	//    最终的第一条 user message 内容（chars[4,7,20]）。
-	ccPromptTrimmed := strings.TrimSpace(claudeCodeSystemPrompt)
-	if originalSystemText != "" && originalSystemText != ccPromptTrimmed && !hasClaudeCodePrefix(originalSystemText) {
-		instrMsg, err1 := json.Marshal(map[string]any{
-			"role": "user",
-			"content": []map[string]any{
-				{"type": "text", "text": "[System Instructions]\n" + originalSystemText},
-			},
-		})
-		ackMsg, err2 := json.Marshal(map[string]any{
-			"role": "assistant",
-			"content": []map[string]any{
-				{"type": "text", "text": "Understood. I will follow these instructions."},
-			},
-		})
-		if err1 != nil || err2 != nil {
-			logger.LegacyPrintf("service.gateway", "Warning: failed to marshal system-to-messages injection")
-			return body
-		}
-
-		// 重建 messages 数组：[instruction, ack, ...originalMessages]
-		items := [][]byte{instrMsg, ackMsg}
-		messagesResult := gjson.GetBytes(body, "messages")
-		if messagesResult.IsArray() {
-			messagesResult.ForEach(func(_, msg gjson.Result) bool {
-				items = append(items, []byte(msg.Raw))
-				return true
-			})
-		}
-
-		if next, setOk := setJSONRawBytes(body, "messages", buildJSONArrayRaw(items)); setOk {
-			body = next
-		}
-	}
-
-	// 3. 构造 system 数组，对齐真实 Claude Code CLI 的 2-block 形态：
+	// 2. 构造 system 数组，对齐真实 Claude Code CLI 的多 block 形态：
 	//    [0] billing attribution block（cc_version={cliVer}.{fp}; cc_entrypoint=cli; cch=00000;）
 	//    [1] "You are Claude Code..." prompt block（带 cache_control 作为稳定缓存断点）
+	//    [2] 原始 system prompt（作为附加上下文，不带 cache_control）
+	//
+	//    真实 CLI 的 system 数组也包含多个 block（CLAUDE.md、工具定义等），
+	//    将原始 system prompt 放在 system 数组中比注入为 user/assistant 消息对更自然，
+	//    避免产生可被统计检测的固定消息模式。
 	//
 	//    billing block 的 cch=00000 是占位符，会被 buildUpstreamRequest 里的
 	//    signBillingHeaderCCH 替换成 xxhash64 签名。缺失 billing block 的系统 payload
@@ -4158,12 +4085,24 @@ func rewriteSystemForNonClaudeCode(body []byte, system any) []byte {
 	//    注意：fingerprint 基于 messages 中第一条 user 消息的 chars[4,7,20] 计算，
 	//    因此必须在消息注入完成后再调用 buildBillingAttributionBlockJSON。
 	billingBlock, billingErr := buildBillingAttributionBlockJSON(body, claude.CLICurrentVersion)
-	ccPromptBlock, ccErr := marshalAnthropicSystemTextBlock(claudeCodeSystemPromptExtended, true)
+	ccPromptBlock, ccErr := marshalAnthropicSystemTextBlock(claudeCodeSystemPrompt, true)
 	if billingErr != nil || ccErr != nil {
 		logger.LegacyPrintf("service.gateway", "Warning: failed to build system blocks (billing=%v, cc=%v)", billingErr, ccErr)
 		return body
 	}
-	out, ok := setJSONRawBytes(body, "system", buildJSONArrayRaw([][]byte{billingBlock, ccPromptBlock}))
+
+	systemBlocks := [][]byte{billingBlock, ccPromptBlock}
+
+	// 将原始 system prompt 作为附加 block 追加到 system 数组
+	ccPromptTrimmed := strings.TrimSpace(claudeCodeSystemPrompt)
+	if originalSystemText != "" && originalSystemText != ccPromptTrimmed && !hasClaudeCodePrefix(originalSystemText) {
+		extraBlock, extraErr := marshalAnthropicSystemTextBlock(originalSystemText, false)
+		if extraErr == nil {
+			systemBlocks = append(systemBlocks, extraBlock)
+		}
+	}
+
+	out, ok := setJSONRawBytes(body, "system", buildJSONArrayRaw(systemBlocks))
 	if !ok {
 		logger.LegacyPrintf("service.gateway", "Warning: failed to set Claude Code system prompt")
 		return body
